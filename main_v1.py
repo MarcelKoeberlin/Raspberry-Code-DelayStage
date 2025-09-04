@@ -22,11 +22,11 @@ class PATHS:
     # GROUP_ROOT is the final destination for the data on the network share.
     # All session data will be copied here upon successful completion of a run.
     # Example for a real setup: "/home/moritz/groupshares/attophys/Attoline"
-    GROUP_ROOT = '/home/moritz/groupshares/attophys/Attoline/2025/DelayStage'
+    GROUP_ROOT = '/home/moritz/groupshares/attophys/Attoline/TEST/delay server'
     
     # LOCAL_ROOT is the temporary storage location on the Raspberry Pi's local disk.
     # Data is saved here first to prevent data loss if the network is unavailable.
-    LOCAL_ROOT = '/home/moritz/Desktop/DelayStage_Data'
+    LOCAL_ROOT = '/home/moritz/Desktop/SIM local'
 
 # SETTINGS ##############################################
 # This class holds the core experimental parameters that can be adjusted.
@@ -169,7 +169,7 @@ def background_copier(local_path: str, remote_path: str, stop_event: threading.E
     :param stop_event: A threading.Event to signal when the thread should stop.
     """
     print("Background copy thread started.")
-    while not stop_event.wait(5.0):  # Wait for 5 seconds, or until the event is set
+    while not stop_event.wait(10.0):  # Wait for 10 seconds, or until the event is set
         try:
             if not os.path.exists(local_path):
                 print(f"Warning: Source file {local_path} not found for copying.")
@@ -181,7 +181,10 @@ def background_copier(local_path: str, remote_path: str, stop_event: threading.E
             
             # Copy the file, overwriting the destination.
             shutil.copy(local_path, remote_path)
-            print(f"Successfully copied data to network: {remote_path}")
+            shortened_path = remote_path.replace(PATHS.GROUP_ROOT, '').lstrip(os.sep)
+            current_time = datetime.now().strftime("%H:%M:%S")
+            print(f"{current_time}: Successfully copied to .../{shortened_path}")
+            # print(f"Successfully copied data to network: {remote_path}")
         except Exception as e:
             print(f"Warning: Failed to copy file to network share: {e}")
     print("Background copy thread stopped.")
@@ -289,10 +292,10 @@ def run_experiment(params, stop_event, on_finish_callback):
             handler.rearm_trigger()
 
             # --- Step 9: Run the main loop ---
-            print("\nExperiment started. Waiting for triggers or stop signal.")
+            print("Experiment started. Waiting for triggers or stop signal.")
             while not stop_event.is_set():
                 time.sleep(0.1)
-            print("\nStop signal received. Cleaning up.")
+            print("Stop signal received. Cleaning up.")
             hf.attrs['end_time_utc'] = datetime.utcnow().isoformat()
 
     except Exception as e:
