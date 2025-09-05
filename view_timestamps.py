@@ -68,12 +68,12 @@ def get_delay_timestamps_spss_spds(filename: str) -> Tuple[np.ndarray, int, int]
     timestamps_s = timestamps_us / 1e6
 
     # Extract spss and spds from filename using regex
-    match = re.search(r"spss_(\d+)_spds_(\d+)", filename)
-    if not match:
-        raise ValueError("spss and spds not found in filename. Expected format: *_spss_<num>_spds_<num>.npz")
+    #match = re.search(r"spss_(\d+)_spds_(\d+)", filename)
+    #if not match:
+     #   raise ValueError("spss and spds not found in filename. Expected format: *_spss_<num>_spds_<num>.npz")
 
-    spss = int(match.group(1))
-    spds = int(match.group(2))
+    #spss = int(match.group(1))
+    #spds = int(match.group(2))
 
     return timestamps_s, spss, spds
 
