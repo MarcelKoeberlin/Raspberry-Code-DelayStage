@@ -10,6 +10,7 @@ from tkinter import simpledialog
 from pathlib import Path
 from typing import Any, Callable
 import shutil
+import h5py
 
 from espstage import ESPStage
 
@@ -59,93 +60,111 @@ class Constants:
 # This class is the heart of the script's logic. It manages the state of the experiment,
 # handles hardware triggers, records data, and controls the movement of the delay stage.
 class TriggerHandler:
-    def __init__(self, esp: ESPStage, timestamp_memmap: Any):
+    def __init__(self, esp: ESPStage, local_h5_path: str, max_timestamps: int):
         """
         Initializes the TriggerHandler.
         
         :param esp: An instance of the ESPStage controller class, used to send commands to the motor.
-        :param timestamp_memmap: A memory-mapped NumPy array for high-performance, real-time data recording.
+        :param local_h5_path: Path to the local HDF5 file for data storage.
+        :param max_timestamps: Maximum number of timestamps to store.
         """
-        print(f"DEBUG: Initializing TriggerHandler with memmap shape: {timestamp_memmap.shape}, dtype: {timestamp_memmap.dtype}")
+        print(f"DEBUG: Initializing TriggerHandler with HDF5 path: {local_h5_path}")
         self.esp = esp
-        self.timestamp_memmap = timestamp_memmap
-        self.trigger_count = 0  # Counter for the number of triggers received.
-        self.move_count = 0     # Counter for the number of moves performed.
-        self.last_trigger_time = None  # Timestamp of the last received trigger.
-        self.last_move_time = None     # Timestamp of the last move command.
-        self._external_callback: Callable[[], None] = lambda: None  # Placeholder for the main logic callback.
+        self.local_h5_path = local_h5_path
+        self.max_timestamps = max_timestamps
+        self.trigger_count = 0
+        self.move_count = 0
+        self.last_trigger_time = None
+        self.last_move_time = None
+        self._external_callback: Callable[[], None] = lambda: None
+        self.h5_lock = threading.Lock()  # Thread-safe access to HDF5
+        
+        # Initialize HDF5 file
+        self._init_h5_file()
         print(f"DEBUG: TriggerHandler initialized. trigger_count={self.trigger_count}, move_count={self.move_count}")
 
+    def _init_h5_file(self):
+        """Initialize the local HDF5 file with datasets."""
+        print(f"DEBUG: Initializing HDF5 file: {self.local_h5_path}")
+        try:
+            with h5py.File(self.local_h5_path, 'w') as f:
+                # Create dataset for timestamps
+                f.create_dataset('timestamps_us', (self.max_timestamps,), dtype='int64', 
+                               maxshape=(None,), fillvalue=0)
+                
+                # Create metadata group
+                meta = f.create_group('metadata')
+                meta.attrs['trigger_count'] = 0
+                meta.attrs['move_count'] = 0
+                meta.attrs['created'] = datetime.now().isoformat()
+                
+                print(f"DEBUG: HDF5 file initialized successfully")
+        except Exception as e:
+            print(f"ERROR: Failed to initialize HDF5 file: {e}")
+            raise
+
     def record_trigger(self):
-        """
-        Records a single timestamp when a hardware trigger is detected.
-        This function is designed to be as fast as possible to not miss any triggers.
-        """
+        """Records a single timestamp when a hardware trigger is detected."""
         print(f"DEBUG: record_trigger() called. Current trigger_count: {self.trigger_count}")
-        print(f"DEBUG: Memmap array length: {len(self.timestamp_memmap)}")
         
-        # Record the current time with high precision.
         now = time.time()
-        timestamp_us = int(time.time_ns() // 1000)  # Convert nanoseconds to microseconds.
+        timestamp_us = int(time.time_ns() // 1000)
         print(f"DEBUG: Generated timestamp - now: {now:.6f}, timestamp_us: {timestamp_us}")
 
-        # Check if there is still space in the pre-allocated array.
-        if self.trigger_count < len(self.timestamp_memmap):
-            print(f"DEBUG: Space available in memmap. Writing timestamp at index {self.trigger_count}")
+        if self.trigger_count < self.max_timestamps:
+            print(f"DEBUG: Writing timestamp to HDF5 at index {self.trigger_count}")
             
-            # Write the timestamp to the memory-mapped file.
             try:
-                self.timestamp_memmap[self.trigger_count] = timestamp_us
-                print(f"DEBUG: Successfully wrote timestamp {timestamp_us} to index {self.trigger_count}")
+                with self.h5_lock:
+                    with h5py.File(self.local_h5_path, 'a') as f:
+                        # Write timestamp
+                        f['timestamps_us'][self.trigger_count] = timestamp_us
+                        
+                        # Update metadata
+                        f['metadata'].attrs['trigger_count'] = self.trigger_count + 1
+                        f['metadata'].attrs['last_update'] = datetime.now().isoformat()
+                        
+                        # Flush to disk
+                        f.flush()
+                        
+                print(f"DEBUG: Successfully wrote timestamp {timestamp_us} to HDF5")
                 
-                # .flush() ensures the data is written from memory to the disk immediately.
-                # This is crucial for data integrity in case of a power failure.
-                self.timestamp_memmap.flush()
-                print(f"DEBUG: Memmap flushed to disk")
+                delta_trigger = now - self.last_trigger_time if self.last_trigger_time else 0
+                delta_move = now - self.last_move_time if self.last_move_time else 0
+                print(f"Trigger {self.trigger_count + 1} received — Δt_trigger = {delta_trigger:.2f}s, Δt_move = {delta_move:.2f}s")
                 
-                # Verify the write was successful
-                read_back = self.timestamp_memmap[self.trigger_count]
-                print(f"DEBUG: Read-back verification: {read_back} (expected: {timestamp_us})")
-                if read_back != timestamp_us:
-                    print(f"ERROR: Write verification failed! Expected {timestamp_us}, got {read_back}")
+                self.last_trigger_time = now
+                self.trigger_count += 1
+                print(f"DEBUG: Incremented trigger_count to {self.trigger_count}")
                 
             except Exception as e:
-                print(f"ERROR: Failed to write timestamp to memmap: {e}")
-                print(f"ERROR: trigger_count={self.trigger_count}, memmap_len={len(self.timestamp_memmap)}")
+                print(f"ERROR: Failed to write timestamp to HDF5: {e}")
                 return
-            
-            # Print diagnostic information about the timing.
-            delta_trigger = now - self.last_trigger_time if self.last_trigger_time else 0
-            delta_move = now - self.last_move_time if self.last_move_time else 0
-            print(f"Trigger {self.trigger_count + 1} received — Δt_trigger = {delta_trigger:.2f}s, Δt_move = {delta_move:.2f}s")
-            
-            self.last_trigger_time = now
-            self.trigger_count += 1
-            print(f"DEBUG: Incremented trigger_count to {self.trigger_count}")
         else:
-            print(f"ERROR: Max timestamps reached. trigger_count={self.trigger_count}, max_len={len(self.timestamp_memmap)}. Ignoring trigger.")
+            print(f"ERROR: Max timestamps reached. trigger_count={self.trigger_count}, max={self.max_timestamps}. Ignoring trigger.")
 
     def perform_move(self):
-        """
-        Executes a relative move of the delay stage.
-        """
+        """Executes a relative move of the delay stage."""
         print(f"DEBUG: perform_move() called. Current move_count: {self.move_count}")
         
-        # Temporarily disable the GPIO trigger to prevent accidental firing during the move.
         print(f"DEBUG: Removing GPIO event detect on pin {Constants.TRIGGER_PIN}")
         GPIO.remove_event_detect(Constants.TRIGGER_PIN)
         
-        # Send the move command to the stage controller.
         try:
             print(f"DEBUG: Sending move command: {float(Settings.MOVE_STEP_MM)} mm")
             self.esp.move_relative(float(Settings.MOVE_STEP_MM))
             self.last_move_time = time.time()
             self.move_count += 1
+            
+            # Update move count in HDF5
+            with self.h5_lock:
+                with h5py.File(self.local_h5_path, 'a') as f:
+                    f['metadata'].attrs['move_count'] = self.move_count
+                    
             print(f"Move {self.move_count} executed successfully")
         except Exception as e:
             print(f"ERROR: Failed to execute move: {e}")
         
-        # Start a timer to re-enable the trigger after the cooldown period.
         print(f"DEBUG: Starting timer for trigger rearm in {Settings.TRIGGER_COOLDOWN_S}s")
         Timer(Settings.TRIGGER_COOLDOWN_S, self.rearm_trigger).start()
 
@@ -216,6 +235,61 @@ class TriggerHandler:
         Timer(Settings.TRIGGER_COOLDOWN_S, self.rearm_trigger).start()
         
 
+# HDF5 SYNC MANAGER #####################################
+class HDF5SyncManager:
+    def __init__(self, local_h5_path: str, server_h5_path: str):
+        self.local_h5_path = local_h5_path
+        self.server_h5_path = server_h5_path
+        self.sync_thread = None
+        self.stop_event = threading.Event()
+        self.sync_interval = 10.0  # seconds
+        
+    def start_sync(self):
+        """Start the background sync thread."""
+        print(f"DEBUG: Starting HDF5 sync thread")
+        self.stop_event.clear()
+        self.sync_thread = threading.Thread(target=self._sync_loop, daemon=True)
+        self.sync_thread.start()
+        
+    def stop_sync(self):
+        """Stop the background sync thread."""
+        print(f"DEBUG: Stopping HDF5 sync thread")
+        self.stop_event.set()
+        if self.sync_thread and self.sync_thread.is_alive():
+            self.sync_thread.join(timeout=5.0)
+            
+    def _sync_loop(self):
+        """Background thread loop for syncing HDF5 files."""
+        print(f"DEBUG: HDF5 sync loop started")
+        while not self.stop_event.is_set():
+            try:
+                self._sync_to_server()
+            except Exception as e:
+                print(f"WARNING: Failed to sync HDF5 to server: {e}")
+                
+            # Wait for next sync interval or stop signal
+            self.stop_event.wait(self.sync_interval)
+            
+        print(f"DEBUG: HDF5 sync loop stopped")
+        
+    def _sync_to_server(self):
+        """Sync the local HDF5 file to the server."""
+        if not os.path.exists(self.local_h5_path):
+            return
+            
+        try:
+            # Ensure server directory exists
+            server_dir = Path(self.server_h5_path).parent
+            server_dir.mkdir(parents=True, exist_ok=True)
+            
+            # Copy the HDF5 file
+            shutil.copy2(self.local_h5_path, self.server_h5_path)
+            print(f"DEBUG: Synced HDF5 to server: {self.server_h5_path}")
+            
+        except Exception as e:
+            print(f"ERROR: Failed to sync HDF5 to server: {e}")
+            raise
+
 # MAIN APPLICATION CLASS #########################################
 class ExperimentController:
     def __init__(self, root):
@@ -265,7 +339,7 @@ def run_experiment(params, stop_event, on_finish_callback):
     print(f"DEBUG: run_experiment() started with params: {params}")
     esp = None
     handler = None
-    local_tmp_mmap_path = None
+    sync_manager = None
     local_session_dir = None
     
     try:
@@ -282,37 +356,12 @@ def run_experiment(params, stop_event, on_finish_callback):
 
         # --- Step 3: Prepare storage paths ---
         print(f"DEBUG: Preparing session paths...")
-        local_session_dir, local_final_npz_path, local_tmp_mmap_path = prepare_session_paths()
+        local_session_dir, local_h5_path, server_h5_path = prepare_session_paths()
         print(f"Saving data locally to: {local_session_dir}")
-        print(f"DEBUG: NPZ path: {local_final_npz_path}")
-        print(f"DEBUG: Memmap path: {local_tmp_mmap_path}")
+        print(f"DEBUG: Local HDF5 path: {local_h5_path}")
+        print(f"DEBUG: Server HDF5 path: {server_h5_path}")
         
-        # --- Step 4: Set up the memory-mapped file for live data ---
-        print(f"DEBUG: Creating memmap with shape ({Settings.MAX_MOVE_STEPS * 2},) at {local_tmp_mmap_path}")
-        try:
-            mmap_array = np.memmap(
-                local_tmp_mmap_path,
-                dtype="int64",
-                mode="w+",
-                shape=(Settings.MAX_MOVE_STEPS * 2,)
-            )
-            print(f"DEBUG: Memmap created successfully. Shape: {mmap_array.shape}, dtype: {mmap_array.dtype}")
-            print(f"DEBUG: Memmap file exists: {os.path.exists(local_tmp_mmap_path)}")
-            print(f"DEBUG: Memmap file size: {os.path.getsize(local_tmp_mmap_path) if os.path.exists(local_tmp_mmap_path) else 'N/A'} bytes")
-            
-            # Test write to memmap
-            print(f"DEBUG: Testing memmap write...")
-            test_value = 12345
-            mmap_array[0] = test_value
-            mmap_array.flush()
-            read_value = mmap_array[0]
-            print(f"DEBUG: Memmap test - wrote {test_value}, read {read_value}, success: {test_value == read_value}")
-            
-        except Exception as e:
-            print(f"ERROR: Failed to create memmap: {e}")
-            raise
-
-        # --- Step 5: Initialize hardware controllers ---
+        # --- Step 4: Initialize hardware controllers ---
         print(f"DEBUG: Initializing ESP stage on /dev/ttyUSB0...")
         try:
             esp = ESPStage("/dev/ttyUSB0", baud=19200, axis=1)
@@ -322,7 +371,13 @@ def run_experiment(params, stop_event, on_finish_callback):
             raise
             
         print(f"DEBUG: Creating TriggerHandler...")
-        handler = TriggerHandler(esp, mmap_array)
+        max_timestamps = Settings.MAX_MOVE_STEPS * 2
+        handler = TriggerHandler(esp, local_h5_path, max_timestamps)
+
+        # --- Step 5: Start HDF5 sync manager ---
+        print(f"DEBUG: Starting HDF5 sync manager...")
+        sync_manager = HDF5SyncManager(local_h5_path, server_h5_path)
+        sync_manager.start_sync()
 
         # --- Step 6: Configure GPIO for hardware triggers ---
         print(f"DEBUG: Configuring GPIO...")
@@ -331,7 +386,6 @@ def run_experiment(params, stop_event, on_finish_callback):
             GPIO.setup(Constants.TRIGGER_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)
             print(f"DEBUG: GPIO configured - pin {Constants.TRIGGER_PIN} set as input with pull-down")
             
-            # Read initial GPIO state
             initial_state = GPIO.input(Constants.TRIGGER_PIN)
             print(f"DEBUG: Initial GPIO state on pin {Constants.TRIGGER_PIN}: {initial_state}")
         except Exception as e:
@@ -353,7 +407,11 @@ def run_experiment(params, stop_event, on_finish_callback):
         print(f"DEBUG: Rearming trigger...")
         handler.rearm_trigger()
 
-        # --- Step 8: Run the main loop ---
+        # --- Step 8: Save experimental parameters to HDF5 ---
+        print(f"DEBUG: Saving experimental parameters to HDF5...")
+        save_experiment_metadata(local_h5_path, ppas, spss, spds, np.abs(move_step_mm))
+
+        # --- Step 9: Run the main loop ---
         print("\nExperiment started. Waiting for triggers or stop signal.")
         print(f"DEBUG: Entering main loop. Stop event set: {stop_event.is_set()}")
         
@@ -372,33 +430,16 @@ def run_experiment(params, stop_event, on_finish_callback):
         traceback.print_exc()
     finally:
         # --- Final Cleanup and Save ---
-        print(f"DEBUG: Starting cleanup and save...")
-        if handler:
-            try:
-                print(f"DEBUG: Saving final NPZ with {handler.trigger_count} timestamps...")
-                save_final_npz(local_final_npz_path, mmap_array, handler.trigger_count, ppas, spss, spds, np.abs(move_step_mm))
-            except Exception as e:
-                print(f"CRITICAL: failed to save local NPZ file: {e}")
-                import traceback
-                traceback.print_exc()
+        print(f"DEBUG: Starting cleanup...")
         
-        if local_session_dir:
+        if sync_manager:
+            print(f"DEBUG: Stopping sync manager and performing final sync...")
+            sync_manager.stop_sync()
+            # Perform one final sync
             try:
-                print(f"DEBUG: Copying session data to network share...")
-                dest_dir = Path(PATHS.GROUP_ROOT) / Path(local_session_dir).relative_to(PATHS.LOCAL_ROOT)
-                dest_dir.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copytree(local_session_dir, dest_dir, dirs_exist_ok=True)
-                print(f"Successfully copied session data to: {dest_dir}")
+                sync_manager._sync_to_server()
             except Exception as e:
-                print(f"Warning: could not copy data to network share: {e}")
-                print(f"Data remains available locally at: {local_session_dir}")
-
-        if local_tmp_mmap_path and os.path.exists(local_tmp_mmap_path):
-            try:
-                print(f"DEBUG: Removing temporary memmap file: {local_tmp_mmap_path}")
-                os.remove(local_tmp_mmap_path)
-            except Exception as e:
-                print(f"Warning: could not remove temporary file: {e}")
+                print(f"Warning: Final sync failed: {e}")
 
         print(f"DEBUG: Cleaning up GPIO...")
         GPIO.cleanup()
@@ -407,7 +448,6 @@ def run_experiment(params, stop_event, on_finish_callback):
             esp.close()
         print("GPIO cleaned up, stage closed.")
         
-        # Notify the main thread that the experiment is finished
         print(f"DEBUG: Calling finish callback...")
         on_finish_callback()
 
@@ -431,9 +471,9 @@ def ask_for_all_parameters(parent):
     dialog.grab_set()
 
     params_config = {
-        "ppas": {"label": "ppas", "comment": "Pulses per Acquisition State (~exp. time)", "default": "4"},
-        "spss": {"label": "spss", "comment": "Shots per Shutter State", "default": "8"},
-        "spds": {"label": "spds", "comment": "Shots per Delay State", "default": "100"},
+        "ppas": {"label": "ppas", "comment": "Pulses per Acquisition State (~exp. time)", "default": "30"},
+        "spss": {"label": "spss", "comment": "Shots per Shutter State", "default": "10"},
+        "spds": {"label": "spds", "comment": "Shots per Delay State", "default": "80"},
         "move_step_fs": {"label": "Move Step (fs)", "comment": "Temporal resolution (fs)", "default": Settings.MOVE_STEP_FS},
         "max_move_steps": {"label": "Max Move Steps", "comment": "Max. number of steps", "default": Settings.MAX_MOVE_STEPS},
     }
@@ -503,13 +543,8 @@ def delay_fs_to_mm(delay_fs: float) -> float:
 # ############### HELPERS FOR PATHS AND SAVING #################
 def prepare_session_paths():
     """
-    Determines the next available session index by checking the network share (GROUP_ROOT),
-    and then creates the corresponding session directory on the local disk (LOCAL_ROOT).
-    This is a critical safety feature to prevent overwriting existing data on the server,
-    especially if local data has been cleared.
-
-    :return: A tuple containing the paths for the local session directory, the final NPZ file,
-             and the temporary binary file.
+    Determines the next available session index and creates session directory paths.
+    Returns paths for local and server HDF5 files.
     """
     print(f"DEBUG: prepare_session_paths() called")
     now = datetime.now()
@@ -518,7 +553,6 @@ def prepare_session_paths():
     print(f"DEBUG: Date strings - yyyy: {yyyy}, yymmdd: {yymmdd}")
 
     # --- Step 1: Determine the next session index by checking the SERVER. ---
-    # This ensures that the session number is always unique on the central storage.
     server_day_dir = Path(PATHS.GROUP_ROOT) / yyyy / "DelayStage" / yymmdd
     print(f"DEBUG: Server day dir: {server_day_dir}")
     print(f"DEBUG: Server day dir exists: {server_day_dir.exists()}")
@@ -526,16 +560,12 @@ def prepare_session_paths():
     next_idx = 1
     for idx in range(1, 1000):
         idx_str = f"{idx:03d}"
-        # Check if a folder for this session index already exists on the server.
         server_session_dir = server_day_dir / f"{yymmdd}_{idx_str}"
         if not server_session_dir.exists():
-            # If it doesn't exist, we've found our index.
             next_idx = idx
             print(f"DEBUG: Found available session index: {next_idx}")
             break
     else:
-        # This `else` belongs to the `for` loop and executes if the loop completes without a `break`.
-        # This would mean all numbers from 001 to 999 are taken.
         raise RuntimeError("No available session indices (001-999) left for today on the server.")
 
     # --- Step 2: Create the session directory LOCALLY using the determined index. ---
@@ -544,87 +574,43 @@ def prepare_session_paths():
     local_session_dir = local_day_dir / f"{yymmdd}_{idx_str}"
     print(f"DEBUG: Creating local session dir: {local_session_dir}")
     
-    # `parents=True` creates any missing parent directories. `exist_ok=True` prevents errors if the folder already exists.
     local_session_dir.mkdir(parents=True, exist_ok=True)
     print(f"DEBUG: Local session dir created. Exists: {local_session_dir.exists()}")
 
-    # --- Step 3: Define and return the full paths for the local files. ---
-    npz_path = local_session_dir / f"delay_{yymmdd}_S{idx_str}.npz"
-    tmp_path = local_session_dir / f"timestamps_S{idx_str}.bin"
+    # --- Step 3: Define HDF5 file paths ---
+    h5_filename = f"delay_{yymmdd}_S{idx_str}.h5"
+    local_h5_path = local_session_dir / h5_filename
     
-    print(f"DEBUG: NPZ path: {npz_path}")
-    print(f"DEBUG: TMP path: {tmp_path}")
+    server_session_dir = Path(PATHS.GROUP_ROOT) / yyyy / "DelayStage" / yymmdd / f"{yymmdd}_{idx_str}"
+    server_h5_path = server_session_dir / h5_filename
     
-    return str(local_session_dir), str(npz_path), str(tmp_path)
+    print(f"DEBUG: Local HDF5 path: {local_h5_path}")
+    print(f"DEBUG: Server HDF5 path: {server_h5_path}")
+    
+    return str(local_session_dir), str(local_h5_path), str(server_h5_path)
 
 
-def save_final_npz(npz_path: str, mmap_array: Any, count: int, ppas: int, spss: int, spds: int, step_mm: float):
+def save_experiment_metadata(h5_path: str, ppas: int, spss: int, spds: int, step_mm: float):
     """
-    Saves the collected timestamp data and metadata into a compressed NumPy file (.npz).
-    This function includes a final safety check to prevent accidentally overwriting a file
-    if it was created by another process in the meantime.
-    
-    :param npz_path: The target path for the .npz file.
-    :param mmap_array: The memory-mapped array containing the raw timestamp data.
-    :param count: The total number of valid timestamps recorded.
-    :param ppas, spss, spds: Experimental parameters to be saved as metadata.
-    :param step_mm: The move step in millimeters, also saved as metadata.
+    Save experimental parameters to the HDF5 file metadata.
     """
-    print(f"DEBUG: save_final_npz() called with count={count}, npz_path={npz_path}")
-    
-    # Final safety check: if the target file already exists, find a new name.
-    # This is a fallback and should ideally not be triggered if `prepare_session_paths` works correctly.
-    if os.path.exists(npz_path):
-        print(f"WARNING: NPZ file already exists: {npz_path}")
-        session_dir = str(Path(npz_path).parent)
-        parent = Path(session_dir).name
-        try:
-            yymmdd, cur_idx = parent.split("_")
-        except ValueError:
-            raise FileExistsError(f"Refusing to overwrite existing file: {npz_path}")
-        
-        base_day_dir = str(Path(session_dir).parent)
-        for idx in range(int(cur_idx) + 1, 1000):
-            idx_str = f"{idx:03d}"
-            new_session_dir = os.path.join(base_day_dir, f"{yymmdd}_{idx_str}")
-            new_npz_path = os.path.join(new_session_dir, f"delay_{yymmdd}_S{idx_str}.npz")
-            if not os.path.exists(new_npz_path):
-                os.makedirs(new_session_dir, exist_ok=True)
-                npz_path = new_npz_path
-                print(f"DEBUG: Using alternative NPZ path: {npz_path}")
-                break
+    print(f"DEBUG: save_experiment_metadata() called")
+    try:
+        with h5py.File(h5_path, 'a') as f:
+            meta = f['metadata']
+            meta.attrs['ppas'] = ppas
+            meta.attrs['spss'] = spss
+            meta.attrs['spds'] = spds
+            meta.attrs['step_mm'] = step_mm
+            meta.attrs['experiment_started'] = datetime.now().isoformat()
+            f.flush()
+        print(f"DEBUG: Experimental metadata saved to HDF5")
+    except Exception as e:
+        print(f"ERROR: Failed to save experimental metadata: {e}")
+        raise
 
-    # Extract the valid data from the memory-mapped array.
-    # `mmap_array` was pre-allocated, so we only take the first `count` entries.
-    print(f"DEBUG: Extracting {count} timestamps from memmap array")
-    try:
-        data = np.asarray(mmap_array[:count], dtype=np.int64)
-        print(f"DEBUG: Extracted data shape: {data.shape}, dtype: {data.dtype}")
-        print(f"DEBUG: First few timestamps: {data[:min(5, len(data))].tolist()}")
-        print(f"DEBUG: Last few timestamps: {data[max(0, len(data)-5):].tolist()}")
-    except Exception as e:
-        print(f"ERROR: Failed to extract data from memmap: {e}")
-        raise
-    
-    # Save the data and metadata into a single, compressed .npz file.
-    # This is efficient and keeps all relevant information for a run together.
-    try:
-        print(f"DEBUG: Saving NPZ file with metadata - ppas:{ppas}, spss:{spss}, spds:{spds}, step_mm:{step_mm}")
-        np.savez_compressed(
-            npz_path,
-            timestamps_us=data,
-            ppas=int(ppas),
-            spss=int(spss),
-            spds=int(spds),
-            step_mm=float(step_mm),
-        )
-        print(f"Saved NPZ: {npz_path} (timestamps: {count})")
-        print(f"DEBUG: NPZ file exists after save: {os.path.exists(npz_path)}")
-        if os.path.exists(npz_path):
-            print(f"DEBUG: NPZ file size: {os.path.getsize(npz_path)} bytes")
-    except Exception as e:
-        print(f"ERROR: Failed to save NPZ file: {e}")
-        raise
+# This ensures that the `main()` function is called only when the script is executed directly.
+
     
 # This ensures that the `main()` function is called only when the script is executed directly.
 if __name__ == "__main__":
