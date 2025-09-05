@@ -13,7 +13,7 @@ import shutil
 import h5py
 
 from espstage import ESPStage
-
+# A comment to notify that this version works with v3
 # PATHS #################################################
 # This class holds the directory paths for data storage.
 # It's designed to separate temporary local storage from the final network storage
