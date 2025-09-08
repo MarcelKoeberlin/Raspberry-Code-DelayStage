@@ -6,11 +6,14 @@ import RPi.GPIO as GPIO
 from threading import Timer
 from datetime import datetime
 import tkinter as tk
-from tkinter import simpledialog
+from tkinter import simpledialog, messagebox, scrolledtext
 from pathlib import Path
 from typing import Any, Callable
 import shutil
 import h5py
+import sys
+import io
+from collections import deque
 
 from espstage import ESPStage
 # A comment to notify that this version works with v3
@@ -295,21 +298,218 @@ class ExperimentController:
     def __init__(self, root):
         self.root = root
         self.root.title("Experiment Control")
+        self.root.geometry("1280x720")  # Increased height for terminal output
+        self.root.minsize(1280, 600)    # Set minimum window size
         self.experiment_thread = None
         self.stop_event = threading.Event()
+        
+        # Terminal output buffer (keep last 50 lines)
+        self.terminal_buffer = deque(maxlen=50)
+        
+        # Create main container
+        container = tk.Frame(root)
+        container.pack(fill=tk.BOTH, expand=True, padx=20, pady=20)
+        
+        # Top frame for controls and settings
+        top_frame = tk.Frame(container)
+        top_frame.pack(fill=tk.BOTH, expand=False, pady=(0, 10))
+        
+        # Left side - Control buttons
+        control_frame = tk.Frame(top_frame, relief=tk.RAISED, borderwidth=1, bg="#f0f0f0")
+        control_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 10))
+        
+        tk.Label(control_frame, text="Experiment Control", font=("Arial", 18, "bold"), bg="#f0f0f0").pack(pady=(20, 30))
+        
+        self.start_button = tk.Button(control_frame, text="Start Experiment", command=self.start_experiment, 
+                                    font=("Arial", 18, "bold"), bg="#4CAF50", fg="white", width=18, height=3)
+        self.start_button.pack(pady=15)
 
-        self.start_button = tk.Button(root, text="Settings", command=self.start_experiment)
-        self.start_button.pack(pady=10)
+        self.stop_button = tk.Button(control_frame, text="Stop Experiment", command=self.stop_experiment, 
+                                   state=tk.DISABLED, font=("Arial", 18, "bold"), bg="#f44336", fg="white", width=18, height=3)
+        self.stop_button.pack(pady=15)
+        
+        # Right side - Settings
+        settings_frame = tk.Frame(top_frame, relief=tk.RAISED, borderwidth=1, bg="#fafafa")
+        settings_frame.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+        
+        # Warning comment
+        warning_label = tk.Label(settings_frame, text="⚠️ Changes should not be made during an experiment", 
+                               font=("Arial", 18, "italic"), fg="red", bg="#fafafa")
+        warning_label.pack(pady=(15, 10))
+        
+        tk.Label(settings_frame, text="Experiment Settings", font=("Arial", 18, "bold"), bg="#fafafa").pack(pady=(0, 25))
+        
+        # Create settings entries
+        self.entries = {}
+        params_config = {
+            "ppas": {"label": "Pulses per Acquisition State", "comment": "~exp. time", "default": "30"},
+            "spss": {"label": "Shots per Shutter State", "comment": "", "default": "10"},
+            "spds": {"label": "Shots per Delay State", "comment": "", "default": "80"},
+            "move_step_fs": {"label": "Move Step (fs)", "comment": "Temporal resolution", "default": Settings.MOVE_STEP_FS},
+            "max_move_steps": {"label": "Max Move Steps", "comment": "Max. number of steps", "default": Settings.MAX_MOVE_STEPS},
+        }
+        
+        for i, (key, data) in enumerate(params_config.items()):
+            param_frame = tk.Frame(settings_frame, bg="#fafafa")
+            param_frame.pack(fill=tk.X, padx=20, pady=8)
+            
+            tk.Label(param_frame, text=data["label"], width=25, anchor="w", 
+                    font=("Arial", 18), bg="#fafafa").pack(side=tk.LEFT)
+            entry = tk.Entry(param_frame, width=12, font=("Arial", 18))
+            entry.pack(side=tk.LEFT, padx=(10, 5))
+            entry.insert(0, str(data["default"]))
+            self.entries[key] = entry
+            
+            if data["comment"]:
+                tk.Label(param_frame, text=f"({data['comment']})", fg="grey", 
+                        font=("Arial", 18), bg="#fafafa").pack(side=tk.LEFT)
 
-        self.stop_button = tk.Button(root, text="Stop Experiment", command=self.stop_experiment, state=tk.DISABLED)
-        self.stop_button.pack(pady=10)
+        # Configure top frame grid weights
+        top_frame.grid_columnconfigure(0, weight=1)
+        top_frame.grid_columnconfigure(1, weight=2)
+        top_frame.grid_rowconfigure(0, weight=1)
+        
+        # Bottom frame - Terminal output
+        terminal_frame = tk.Frame(container, relief=tk.RAISED, borderwidth=1, bg="#1e1e1e")
+        terminal_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
+        
+        # Terminal header with title and clear button
+        terminal_header = tk.Frame(terminal_frame, bg="#1e1e1e")
+        terminal_header.pack(fill=tk.X, padx=10, pady=(10, 5))
+        
+        tk.Label(terminal_header, text="Terminal Output (Last 15 lines)", font=("Arial", 14, "bold"), 
+                bg="#1e1e1e", fg="white").pack(side=tk.LEFT)
+        
+        clear_button = tk.Button(terminal_header, text="Clear", font=("Arial", 12), 
+                               bg="#555555", fg="white", command=self.clear_terminal)
+        clear_button.pack(side=tk.RIGHT)
+        
+        # Create scrolled text widget for terminal output
+        self.terminal_output = scrolledtext.ScrolledText(
+            terminal_frame, 
+            height=30, 
+            bg="#2d2d2d", 
+            fg="#00ff00",  # Green text like terminal
+            font=("Consolas", 12),
+            insertbackground="white",
+            state=tk.DISABLED,
+            wrap=tk.WORD
+        )
+        self.terminal_output.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+        
+        # Configure color tags for different message types
+        self.terminal_output.tag_config("error", foreground="#ff4444")
+        self.terminal_output.tag_config("warning", foreground="#ffaa00")
+        self.terminal_output.tag_config("debug", foreground="#888888")
+        self.terminal_output.tag_config("important", foreground="#00aaff")
+        self.terminal_output.tag_config("normal", foreground="#00ff00")
+        
+        # Setup print redirection
+        self.setup_print_capture()
         
         self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+    
+    def setup_print_capture(self):
+        """Setup print statement capture to display in GUI terminal"""
+        self.original_stdout = sys.stdout
+        self.original_stderr = sys.stderr
+        
+        # Create a custom output stream that captures print statements
+        class TerminalCapture:
+            def __init__(self, gui_callback):
+                self.gui_callback = gui_callback
+                
+            def write(self, text):
+                if text.strip():  # Only process non-empty lines
+                    self.gui_callback(text)
+                # Also write to original stdout so it still appears in console
+                sys.__stdout__.write(text)
+                
+            def flush(self):
+                sys.__stdout__.flush()
+        
+        # Redirect stdout to our capture
+        sys.stdout = TerminalCapture(self.add_terminal_line)
+    
+    def add_terminal_line(self, text):
+        """Add a line to the terminal output display"""
+        def update_gui():
+            # Add to buffer with color coding
+            lines = text.strip().split('\n')
+            for line in lines:
+                if line.strip():
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+                    
+                    # Determine color based on content
+                    if line.startswith("ERROR") or line.startswith("CRITICAL"):
+                        color_tag = "error"
+                    elif line.startswith("WARNING"):
+                        color_tag = "warning"
+                    elif line.startswith("DEBUG"):
+                        color_tag = "debug"
+                    elif "Experiment started" in line or "finished" in line:
+                        color_tag = "important"
+                    else:
+                        color_tag = "normal"
+                    
+                    formatted_line = f"[{timestamp}] {line}\n"
+                    self.terminal_buffer.append((formatted_line, color_tag))
+            
+            # Update the display
+            self.update_terminal_display()
+        
+        # Schedule GUI update in main thread
+        self.root.after(0, update_gui)
+    
+    def clear_terminal(self):
+        """Clear the terminal output display"""
+        self.terminal_buffer.clear()
+        self.terminal_output.config(state=tk.NORMAL)
+        self.terminal_output.delete(1.0, tk.END)
+        self.terminal_output.config(state=tk.DISABLED)
+        
+    def update_terminal_display(self):
+        """Update the terminal display widget"""
+        self.terminal_output.config(state=tk.NORMAL)
+        self.terminal_output.delete(1.0, tk.END)
+        
+        # Show last 15 lines from buffer with color coding
+        recent_lines = list(self.terminal_buffer)[-15:]
+        for line_data in recent_lines:
+            if isinstance(line_data, tuple):
+                line, color_tag = line_data
+                self.terminal_output.insert(tk.END, line, color_tag)
+            else:
+                # Fallback for old format
+                self.terminal_output.insert(tk.END, line_data, "normal")
+        
+        # Auto-scroll to bottom
+        self.terminal_output.see(tk.END)
+        self.terminal_output.config(state=tk.DISABLED)
 
     def start_experiment(self):
-        params = ask_for_all_parameters(self.root)
-        if not params:
+        # Get parameters from the settings entries
+        try:
+            params = {
+                "ppas": int(self.entries["ppas"].get()),
+                "spss": int(self.entries["spss"].get()),
+                "spds": int(self.entries["spds"].get()),
+                "move_step_fs": float(self.entries["move_step_fs"].get()),
+                "max_move_steps": int(self.entries["max_move_steps"].get()),
+            }
+            
+            # Validate parameters
+            if any(params[k] <= 0 for k in ["ppas", "spss", "spds", "max_move_steps"]):
+                tk.messagebox.showerror("Error", "ppas, spss, spds, and max_move_steps must be positive values.")
+                return
+                
+        except ValueError:
+            tk.messagebox.showerror("Error", "Invalid input. Please ensure all values are correct numeric types.")
             return
+
+        # Disable settings entries during experiment
+        for entry in self.entries.values():
+            entry.config(state=tk.DISABLED)
 
         self.start_button.config(state=tk.DISABLED)
         self.stop_button.config(state=tk.NORMAL)
@@ -324,12 +524,20 @@ class ExperimentController:
         self.stop_button.config(state=tk.DISABLED)
 
     def on_experiment_finish(self):
+        # Re-enable settings entries
+        for entry in self.entries.values():
+            entry.config(state=tk.NORMAL)
+            
         self.start_button.config(state=tk.NORMAL)
         self.stop_button.config(state=tk.DISABLED)
         self.experiment_thread = None
         print("Experiment finished and GUI updated.")
 
     def on_closing(self):
+        # Restore original stdout
+        sys.stdout = self.original_stdout
+        sys.stderr = self.original_stderr
+        
         if self.experiment_thread and self.experiment_thread.is_alive():
             print("Please stop the experiment before closing.")
         else:
@@ -460,67 +668,6 @@ def main():
         
 
 # MISC FUNCTIONS ########################################
-def ask_for_all_parameters(parent):
-    """
-    Opens a modal dialog to ask for experimental parameters.
-    Returns a dictionary with parameters, or None if cancelled.
-    """
-    dialog = tk.Toplevel(parent)
-    dialog.title("Experiment Parameters")
-    dialog.transient(parent)
-    dialog.grab_set()
-
-    params_config = {
-        "ppas": {"label": "ppas", "comment": "Pulses per Acquisition State (~exp. time)", "default": "30"},
-        "spss": {"label": "spss", "comment": "Shots per Shutter State", "default": "10"},
-        "spds": {"label": "spds", "comment": "Shots per Delay State", "default": "80"},
-        "move_step_fs": {"label": "Move Step (fs)", "comment": "Temporal resolution (fs)", "default": Settings.MOVE_STEP_FS},
-        "max_move_steps": {"label": "Max Move Steps", "comment": "Max. number of steps", "default": Settings.MAX_MOVE_STEPS},
-    }
-
-    entries = {}
-    for i, (key, data) in enumerate(params_config.items()):
-        tk.Label(dialog, text=data["label"]).grid(row=i, column=0, sticky="w", padx=10, pady=5)
-        entry = tk.Entry(dialog, width=15)
-        entry.grid(row=i, column=1, padx=10, pady=5)
-        entry.insert(0, str(data["default"]))
-        entries[key] = entry
-        tk.Label(dialog, text=data["comment"], fg="grey").grid(row=i, column=2, sticky="w", padx=10, pady=5)
-
-    result = {}
-    
-    def on_submit():
-        nonlocal result
-        try:
-            result = {
-                "ppas": int(entries["ppas"].get()),
-                "spss": int(entries["spss"].get()),
-                "spds": int(entries["spds"].get()),
-                "move_step_fs": float(entries["move_step_fs"].get()),
-                "max_move_steps": int(entries["max_move_steps"].get()),
-            }
-            if any(result[k] <= 0 for k in ["ppas", "spss", "spds", "max_move_steps"]):
-                print("Error: ppas, spss, spds, and max_move_steps must be positive values.")
-                result = {} # Invalidate result
-                return
-            dialog.destroy()
-        except ValueError:
-            print("Error: Invalid input. Please ensure all values are correct numeric types.")
-            result = {} # Invalidate result
-
-    def on_closing():
-        nonlocal result
-        result = None
-        dialog.destroy()
-
-    dialog.protocol("WM_DELETE_WINDOW", on_closing)
-    submit_button = tk.Button(dialog, text="Start Experiment", command=on_submit)
-    submit_button.grid(row=len(params_config), column=0, columnspan=3, pady=20)
-
-    parent.wait_window(dialog)
-    return result if result else None
-
-
 def delay_fs_to_mm(delay_fs: float) -> float:
     """
     Converts a delay time in femtoseconds (fs) to a physical distance in millimeters (mm).
@@ -578,7 +725,7 @@ def prepare_session_paths():
     print(f"DEBUG: Local session dir created. Exists: {local_session_dir.exists()}")
 
     # --- Step 3: Define HDF5 file paths ---
-    h5_filename = f"delay_{yymmdd}_S{idx_str}.h5"
+    h5_filename = f"delay_{yymmdd}_S{idx_str}.hdf5"
     local_h5_path = local_session_dir / h5_filename
     
     server_session_dir = Path(PATHS.GROUP_ROOT) / yyyy / "DelayStage" / yymmdd / f"{yymmdd}_{idx_str}"
