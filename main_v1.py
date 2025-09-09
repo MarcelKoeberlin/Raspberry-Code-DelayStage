@@ -38,9 +38,10 @@ class Settings:
     # This value is used to calculate the equivalent distance in millimeters.
     MOVE_STEP_FS = 20
     
-    # The maximum number of fs the delay stage will perform in a single run.
+    # The maximum number of steps the delay stage will perform in a single run.
+    # The maximum delay in fs is MOVE_STEP_FS * MAX_MOVE_STEPS!
     # This acts as a safety limit and determines the size of the data array.
-    MAX_DELAY_FS = 400
+    MAX_MOVE_STEPS = 200
     
     # The move step converted to millimeters. This is calculated at runtime and should not be set manually.
     MOVE_STEP_MM: float = 0.0
@@ -287,7 +288,9 @@ class HDF5SyncManager:
             
             # Copy the HDF5 file
             shutil.copy2(self.local_h5_path, self.server_h5_path)
-            print(f"DEBUG: Synced HDF5 to server: {self.server_h5_path}")
+            # Get relative path by removing the root directory
+            relative_path = str(Path(self.server_h5_path).relative_to(PATHS.GROUP_ROOT))
+            print(f"DEBUG: Synced HDF5 to server: .../{relative_path}")
             
         except Exception as e:
             print(f"ERROR: Failed to sync HDF5 to server: {e}")
@@ -346,7 +349,7 @@ class ExperimentController:
             "spss": {"label": "Shots per Shutter State", "comment": "", "default": "10"},
             "spds": {"label": "Shots per Delay State", "comment": "", "default": "80"},
             "move_step_fs": {"label": "Move Step (fs)", "comment": "Temporal resolution", "default": Settings.MOVE_STEP_FS},
-            "MAX_DELAY_FS": {"label": "Max. delay", "comment": "Max. delay in fs", "default": Settings.MAX_DELAY_FS},
+            "MAX_MOVE_STEPS": {"label": "Max delay steps", "comment": "NOT the max. delay in fs", "default": Settings.MAX_MOVE_STEPS},
         }
         
         for i, (key, data) in enumerate(params_config.items()):
@@ -495,12 +498,12 @@ class ExperimentController:
                 "spss": int(self.entries["spss"].get()),
                 "spds": int(self.entries["spds"].get()),
                 "move_step_fs": float(self.entries["move_step_fs"].get()),
-                "MAX_DELAY_FS": int(self.entries["MAX_DELAY_FS"].get()),
+                "MAX_MOVE_STEPS": int(self.entries["MAX_MOVE_STEPS"].get()),
             }
             
             # Validate parameters
-            if any(params[k] <= 0 for k in ["ppas", "spss", "spds", "MAX_DELAY_FS"]):
-                tk.messagebox.showerror("Error", "ppas, spss, spds, and MAX_DELAY_FS must be positive values.")
+            if any(params[k] <= 0 for k in ["ppas", "spss", "spds", "MAX_MOVE_STEPS"]):
+                tk.messagebox.showerror("Error", "ppas, spss, spds, and MAX_MOVE_STEPS must be positive values.")
                 return
                 
         except ValueError:
@@ -554,8 +557,8 @@ def run_experiment(params, stop_event, on_finish_callback):
         # --- Step 1: Apply parameters ---
         ppas, spss, spds = params["ppas"], params["spss"], params["spds"]
         Settings.MOVE_STEP_FS = params["move_step_fs"]
-        Settings.MAX_DELAY_FS = params["MAX_DELAY_FS"]
-        print(f"DEBUG: Applied parameters - ppas:{ppas}, spss:{spss}, spds:{spds}, move_step_fs:{Settings.MOVE_STEP_FS}, MAX_DELAY_FS:{Settings.MAX_DELAY_FS}")
+        Settings.MAX_MOVE_STEPS = params["MAX_MOVE_STEPS"]
+        print(f"DEBUG: Applied parameters - ppas:{ppas}, spss:{spss}, spds:{spds}, move_step_fs:{Settings.MOVE_STEP_FS}, MAX_MOVE_STEPS:{Settings.MAX_MOVE_STEPS}")
 
         # --- Step 2: Calculate physical constants ---
         move_step_mm = delay_fs_to_mm(Settings.MOVE_STEP_FS)
@@ -579,7 +582,7 @@ def run_experiment(params, stop_event, on_finish_callback):
             raise
             
         print(f"DEBUG: Creating TriggerHandler...")
-        max_timestamps = Settings.MAX_DELAY_FS * 2
+        max_timestamps = Settings.MAX_MOVE_STEPS * 2
         handler = TriggerHandler(esp, local_h5_path, max_timestamps)
 
         # --- Step 5: Start HDF5 sync manager ---
@@ -617,7 +620,7 @@ def run_experiment(params, stop_event, on_finish_callback):
 
         # --- Step 8: Save experimental parameters to HDF5 ---
         print(f"DEBUG: Saving experimental parameters to HDF5...")
-        save_experiment_metadata(local_h5_path, ppas, spss, spds, np.abs(move_step_mm), Settings.MAX_DELAY_FS)
+        save_experiment_metadata(local_h5_path, ppas, spss, spds, np.abs(move_step_mm), Settings.MAX_MOVE_STEPS)
 
         # --- Step 9: Run the main loop ---
         print("\nExperiment started. Waiting for triggers or stop signal.")
@@ -737,7 +740,7 @@ def prepare_session_paths():
     return str(local_session_dir), str(local_h5_path), str(server_h5_path)
 
 
-def save_experiment_metadata(h5_path: str, ppas: int, spss: int, spds: int, step_mm: float, MAX_DELAY_FS_fs: float):
+def save_experiment_metadata(h5_path: str, ppas: int, spss: int, spds: int, step_mm: float, MAX_MOVE_STEPS_fs: float):
     """
     Save experimental parameters to the HDF5 file metadata.
     """
@@ -749,7 +752,7 @@ def save_experiment_metadata(h5_path: str, ppas: int, spss: int, spds: int, step
             meta.attrs['spss'] = spss
             meta.attrs['spds'] = spds
             meta.attrs['step_mm'] = step_mm
-            meta.attrs['max_move_step_fs'] = MAX_DELAY_FS_fs
+            meta.attrs['max_move_step_fs'] = MAX_MOVE_STEPS_fs
             meta.attrs['experiment_started'] = datetime.now().isoformat()
             f.flush()
         print(f"DEBUG: Experimental metadata saved to HDF5")
